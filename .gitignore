@@ -1,0 +1,7 @@
+/engine/
+/freedoom*.zip
+/*.wad
+/*.cfg
+/*.log
+/.savegame/
+__pycache__/
