@@ -26,7 +26,9 @@ def wait_state(pid, stopped):
         time.sleep(.005)
     raise RuntimeError(f"Process {pid} did not reach expected state")
 
-def play(pid, seconds):
+def play(pid, seconds, episode=1, game_map=1, skill=2, load_slot=None):
+    if load_slot is not None and not (ROOT / '.savegame' / f'doomsav{load_slot}.dsg').is_file():
+        raise RuntimeError(f'Save slot {load_slot} does not exist')
     info = stat(pid)
     shell_pid = info["parent"]
     if Path(f"/proc/{pid}/comm").read_text().strip() != "codex":
@@ -67,7 +69,7 @@ def play(pid, seconds):
     if watchdog == 0:
         os.close(write_end)
         game_pid = None
-        deadline = time.monotonic() + seconds + 8
+        deadline = time.monotonic() + 8
         buffer = b""
         try:
             while time.monotonic() < deadline:
@@ -79,7 +81,10 @@ def play(pid, seconds):
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     if line == b"done": os._exit(0)
-                    game_pid = int(line)
+                    if line == b"alive":
+                        deadline = time.monotonic() + 8
+                    else:
+                        game_pid = int(line)
             if game_pid:
                 try: os.killpg(game_pid, signal.SIGKILL)
                 except ProcessLookupError: pass
@@ -101,19 +106,27 @@ def play(pid, seconds):
         output(OFF)
         termios.tcflush(fd, termios.TCIFLUSH)
         env = dict(os.environ, DOOM_TTY=tty, DOOM_SECONDS=str(seconds))
+        arguments = [
+            str(ROOT / "engine/doomgeneric/doom-terminal"),
+            "-iwad", str(ROOT / "freedoom1.wad"), "-nosound",
+            "-config", str(ROOT / "doom.cfg"),
+        ]
+        if load_slot is None:
+            arguments += ["-warp", str(episode), str(game_map), "-skill", str(skill)]
+        else:
+            arguments += ["-loadgame", str(load_slot)]
         with (ROOT / "last-run.log").open("wb") as log:
-            child = subprocess.Popen([
-                str(ROOT / "engine/doomgeneric/doom-terminal"),
-                "-iwad", str(ROOT / "freedoom1.wad"),
-                "-warp", "1", "1", "-skill", "2", "-nosound",
-                "-config", str(ROOT / "doom.cfg"),
-            ], cwd=ROOT, env=env, stdout=log, stderr=log, start_new_session=True)
+            child = subprocess.Popen(arguments, cwd=ROOT, env=env,
+                                     stdout=log, stderr=log, start_new_session=True)
             os.write(write_end, f"{child.pid}\n".encode())
-            try: child.wait(timeout=seconds+3)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-                raise RuntimeError("Doom exceeded its deadline")
+            deadline = time.monotonic() + seconds + 3 if seconds else None
+            while child.poll() is None:
+                os.write(write_end, b"alive\n")
+                if deadline is not None and time.monotonic() >= deadline:
+                    child.kill()
+                    child.wait()
+                    raise RuntimeError("Doom exceeded its deadline")
+                time.sleep(.2)
     finally:
         try:
             if child is not None and child.poll() is None:
@@ -134,6 +147,15 @@ def play(pid, seconds):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pid", type=int, required=True)
-    parser.add_argument("--seconds", type=int, default=30)
+    def duration(value):
+        result = int(value)
+        if result < 0 or result > 4294967:
+            raise argparse.ArgumentTypeError("seconds must be between 0 and 4294967 (0 = unlimited)")
+        return result
+    parser.add_argument("--seconds", type=duration, default=0, help="0 = unlimited (default)")
+    parser.add_argument("--episode", type=int, choices=range(1, 5), default=1)
+    parser.add_argument("--map", type=int, choices=range(1, 10), default=1)
+    parser.add_argument("--skill", type=int, choices=range(1, 6), default=2)
+    parser.add_argument("--load-slot", type=int, choices=range(6), help="load save slot 0-5")
     args = parser.parse_args()
-    play(args.pid, max(1, min(args.seconds, 300)))
+    play(args.pid, args.seconds, args.episode, args.map, args.skill, args.load_slot)

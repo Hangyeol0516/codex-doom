@@ -2,6 +2,8 @@
 // Terminal backend for doomgeneric; based on the platform interface examples.
 #include "doomgeneric.h"
 #include "doomkeys.h"
+#include "doomstat.h"
+#include "i_system.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -21,6 +23,18 @@ static unsigned short queue[512];
 static unsigned int qr, qw;
 static volatile sig_atomic_t stopping;
 static int escape_state;
+static char sequence[32];
+static size_t sequence_len;
+static uint32_t escape_time;
+extern int saveStringEnter;
+
+static void release_keys(void) {
+    /* Queue releases before menu entry so movement cannot remain held. */
+    for (int k = 0; k < 256; k++) {
+        if (held[k] && qw - qr < 512) queue[qw++ % 512] = k;
+        held[k] = 0;
+    }
+}
 
 uint32_t DG_GetTicksMs(void) {
     struct timespec t;
@@ -73,25 +87,65 @@ static void enqueue(int down, unsigned char key) {
     if (qw - qr < 512) queue[qw++ % 512] = (down << 8) | key;
 }
 static void keypress(unsigned char key) {
-    if (!held[key]) enqueue(1, key);
+    /* Menus and text entry need a keydown for every typed character. */
+    if (menuactive && held[key]) enqueue(0, key);
+    if (!held[key] || menuactive) enqueue(1, key);
     held[key] = DG_GetTicksMs() + 180;
     inputs++;
+}
+static void special_key(unsigned char key) {
+    if (key == KEY_ESCAPE || (key >= KEY_F1 && key <= KEY_F10)) release_keys();
+    keypress(key);
+}
+static void escape_sequence(void) {
+    unsigned char key = 0;
+    if (sequence_len == 1) {
+        switch (sequence[0]) {
+            case 'A': key = KEY_UPARROW; break;
+            case 'B': key = KEY_DOWNARROW; break;
+            case 'C': key = KEY_RIGHTARROW; break;
+            case 'D': key = KEY_LEFTARROW; break;
+            case 'P': key = KEY_F1; break;
+            case 'Q': key = KEY_F2; break;
+            case 'R': key = KEY_F3; break;
+            case 'S': key = KEY_F4; break;
+        }
+    } else if (sequence[sequence_len-1] == '~') {
+        const int numbers[] = {11,12,13,14,15,17,18,19,20,21,23,24};
+        const int keys[] = {KEY_F1,KEY_F2,KEY_F3,KEY_F4,KEY_F5,KEY_F6,
+                            KEY_F7,KEY_F8,KEY_F9,KEY_F10,KEY_F11,KEY_F12};
+        int number = atoi(sequence);
+        for (int i = 0; i < 12; i++) if (number == numbers[i]) key = keys[i];
+    }
+    if (key) special_key(key);
 }
 static void input(void) {
     unsigned char c;
     for (int count = 0; count < 512 && read(fd, &c, 1) == 1; count++) {
-        if (c == 'q' || c == 3) { stopping = 1; return; }
-        if (escape_state == 1 && c == '[') { escape_state = 2; continue; }
-        if (escape_state == 2) {
-            escape_state = 0;
-            if (c == 'A') keypress(KEY_UPARROW);
-            if (c == 'B') keypress(KEY_DOWNARROW);
-            if (c == 'C') keypress(KEY_RIGHTARROW);
-            if (c == 'D') keypress(KEY_LEFTARROW);
+        if (c == 3) { stopping = 1; return; }
+        if (escape_state == 1 && (c == '[' || c == 'O')) {
+            escape_state = 2; sequence_len = 0; continue;
+        }
+        if (escape_state >= 2) {
+            /* Consume the whole CSI/SS3 sequence, including unknown reports. */
+            if (sequence_len < sizeof(sequence)-1) sequence[sequence_len++] = c;
+            else escape_state = 3;
+            if (c >= 0x40 && c <= 0x7e) {
+                sequence[sequence_len] = 0;
+                if (escape_state == 2) escape_sequence();
+                escape_state = 0;
+            }
             continue;
         }
-        if (c == 27) { escape_state = 1; continue; }
-        escape_state = 0;
+        if (escape_state == 1) {
+            special_key(KEY_ESCAPE);
+            escape_state = 0;
+        }
+        if (c == 27) { escape_state = 1; escape_time = DG_GetTicksMs(); continue; }
+        if (c == '\n' || c == '\r') c = KEY_ENTER;
+        if (c == 8 || c == 127) c = KEY_BACKSPACE;
+        if (menuactive || gamestate != GS_LEVEL) { keypress(c); continue; }
+        if (c == 'q') { stopping = 1; return; }
         switch(c) {
             case 'w': c = KEY_UPARROW; break;
             case 's': c = KEY_DOWNARROW; break;
@@ -101,11 +155,16 @@ static void input(void) {
             case 'l': c = KEY_STRAFE_R; break;
             case 'f': c = KEY_FIRE; break;
             case ' ': case 'e': c = KEY_USE; break;
+            case 'r': c = KEY_RSHIFT; break;
             case '\n': c = KEY_ENTER; break;
         }
         keypress(c);
     }
     uint32_t now = DG_GetTicksMs();
+    if (escape_state && now - escape_time >= 40) {
+        if (escape_state == 1) special_key(KEY_ESCAPE);
+        escape_state = 0;
+    }
     for (int k = 0; k < 256; k++)
         if (held[k] && (int32_t)(now - held[k]) >= 0) {
             held[k] = 0; enqueue(0, k);
@@ -143,7 +202,7 @@ void DG_DrawFrame(void) {
         n += snprintf(out+n, sizeof(out)-n, "\033[0m\033[K\r\n");
     }
     n += snprintf(out+n, sizeof(out)-n,
-        "\033[0mDOOM / Freedoom | WASD move/turn | J/L strafe | F fire | SPACE use | Q return\033[K");
+        "\033[0mWASD move | F fire | SPACE use | ESC menu | F2 save | F3 load | Ctrl-C return\033[K");
     send_bytes(out, n);
     frames++;
     if (frames % 100 == 0) fprintf(stderr, "TERMINAL_DOOM progress frames=%d inputs=%d\n", frames, inputs);
@@ -152,8 +211,31 @@ void DG_SetWindowTitle(const char *title) { (void)title; }
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     doomgeneric_Create(argc, argv);
-    int seconds = getenv("DOOM_SECONDS") ? atoi(getenv("DOOM_SECONDS")) : 45;
-    while (!stopping && DG_GetTicksMs() - start < (uint32_t)seconds * 1000)
+    const char *duration = getenv("DOOM_SECONDS");
+    char *end;
+    unsigned long seconds = duration ? strtoul(duration, &end, 10) : 0;
+    if (duration && (!*duration || *duration == '-' || *end || seconds > UINT32_MAX / 1000)) {
+        fprintf(stderr, "DOOM_SECONDS must be 0 (unlimited) or a positive duration <= 4294967\n");
+        return 1;
+    }
+    while (!stopping && (!seconds || DG_GetTicksMs() - start < seconds * 1000)) {
         doomgeneric_Tick();
+        static int last_episode = -1, last_map = -1, last_state = -1, last_menu = -1, last_save = -1;
+        if (gameepisode != last_episode || gamemap != last_map || (int)gamestate != last_state
+            || menuactive != last_menu || saveStringEnter != last_save) {
+            mobj_t *player = gamestate == GS_LEVEL ? players[consoleplayer].mo : NULL;
+            fprintf(stderr, "TERMINAL_STATE episode=%d map=%d state=%d menu=%d saving=%d x=%d y=%d ammo=%d\n",
+                    gameepisode, gamemap, gamestate, menuactive, saveStringEnter,
+                    player ? player->x : 0, player ? player->y : 0,
+                    players[consoleplayer].ammo[am_clip]);
+            last_episode = gameepisode; last_map = gamemap; last_state = gamestate;
+            last_menu = menuactive; last_save = saveStringEnter;
+        }
+#ifdef TERMINAL_TEST
+        extern void TerminalTest_Tick(int frames);
+        TerminalTest_Tick(frames);
+#endif
+    }
+    I_Quit();
     return 0;
 }

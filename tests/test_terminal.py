@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-import ctypes,fcntl,importlib.util,os,pty,re,select,signal,struct,subprocess,sys,termios,time
+import fcntl,os,pty,re,select,signal,struct,subprocess,sys,termios,time,shutil,tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 (ROOT/'engine').mkdir(exist_ok=True)
@@ -34,34 +34,47 @@ def test(mode):
  ttyname=os.readlink(f'/proc/{cli}/fd/0')
  fd=os.open(ttyname,os.O_RDWR|os.O_NOCTTY)
  original=termios.tcgetattr(fd)
- run=subprocess.Popen([sys.executable,str(ROOT/'play-in-codex.py'),'--pid',str(cli),'--seconds','2'],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
- start=time.monotonic();sent=False;interrupted=False
+ temporary=tempfile.TemporaryDirectory(prefix='codex-doom-terminal-')
+ session_root=Path(temporary.name)
+ shutil.copyfile(ROOT/'play-in-codex.py',session_root/'play-in-codex.py')
+ (session_root/'engine').symlink_to(ROOT/'engine',target_is_directory=True)
+ (session_root/'freedoom1.wad').symlink_to(ROOT/'freedoom1.wad')
+ arguments=[sys.executable,str(session_root/'play-in-codex.py'),'--pid',str(cli)]
+ if mode=='normal':arguments+=['--seconds','2']
+ run=subprocess.Popen(arguments,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+ start=time.monotonic();sent=False;interrupted=False;long_quit=False
  try:
   while run.poll() is None or mode=='watchdog' and stat(cli)[0]=='T':
    elapsed=time.monotonic()-start
    if elapsed>.6 and not sent:
     os.write(master,b'wf'+(b'q' if mode=='quit' else b''));sent=True
-   if mode in ('interrupt','watchdog') and elapsed>.8 and not interrupted:
-    run.send_signal(signal.SIGTERM if mode=='interrupt' else signal.SIGKILL);interrupted=True
+   if mode in ('interrupt','watchdog','stalled') and elapsed>.8 and not interrupted:
+    run.send_signal({'interrupt':signal.SIGTERM,'watchdog':signal.SIGKILL,'stalled':signal.SIGSTOP}[mode]);interrupted=True
+   if mode=='stalled' and elapsed>2 and stat(cli)[0] not in ('T','t'):
+    run.kill();run.wait();break
+   if mode=='unlimited' and elapsed>31 and not long_quit:
+    assert run.poll() is None,'unlimited session stopped at the old 30-second limit'
+    os.write(master,b'q');long_quit=True
    if select.select([master],[],[],.05)[0]:captured.extend(os.read(master,65536))
-   assert elapsed<13,'test deadline exceeded'
+   assert elapsed<(45 if mode=='unlimited' else 13),'test deadline exceeded'
   out,err=run.communicate()
   state,fg=stat(cli)
   assert state not in ('T','t'),(mode,state)
   assert fg==os.getpgid(cli),(mode,'foreground',fg,os.getpgid(cli))
   assert stat(shell)[0] not in ('T','t'),(mode,'shell stopped')
   assert termios.tcgetattr(fd)==original,(mode,'terminal settings not restored')
-  if mode in ('normal','quit'):
+  if mode in ('normal','quit','unlimited'):
    assert run.returncode==0,err.decode()
-   log=(ROOT/'last-run.log').read_text()
+   log=(session_root/'last-run.log').read_text()
    match=re.search(r'frames=(\d+) inputs=(\d+) elapsed_ms=(\d+)',log)
    assert match and int(match[1])>0 and int(match[2])>=2,log
    if mode=='quit':assert int(match[3])<1900
+   if mode=='unlimited':assert int(match[3])>=30000 and long_quit
   print(mode,'PASS',state,'foreground restored; terminal settings restored',flush=True)
  finally:
   if run.poll() is None:run.kill();run.wait()
   for pid in (cli,shell):
    try:os.kill(pid,signal.SIGKILL)
    except ProcessLookupError:pass
-  os.waitpid(shell,0);os.close(master);os.close(fd)
-for mode in ('normal','quit','interrupt','watchdog'):test(mode)
+  os.waitpid(shell,0);os.close(master);os.close(fd);temporary.cleanup()
+for mode in ('normal','quit','interrupt','watchdog','stalled','unlimited'):test(mode)
